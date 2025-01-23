@@ -491,8 +491,8 @@ impl Limbo {
             let conn = self.conn.clone();
             let runner = conn.query_runner(buff.as_bytes());
             for output in runner {
-                if let Err(e) = self.print_query_result(&buff, output) {
-                    let _ = self.writeln(e.to_string());
+                if let Err(_) = self.print_query_result(&buff, output) {
+                    break;
                 }
             }
             self.reset_input();
@@ -615,7 +615,7 @@ impl Limbo {
         &mut self,
         sql: &str,
         mut output: Result<Option<Rows>, LimboError>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(), LimboError> {
         match output {
             Ok(Some(ref mut rows)) => match self.opts.output_mode {
                 OutputMode::Raw => loop {
@@ -717,6 +717,8 @@ impl Limbo {
                     "{:?}",
                     miette::Error::from(err).with_source_code(sql.to_owned())
                 ));
+
+                return Err(LimboError::ParseError("".to_string()));
             }
         }
         // for now let's cache flush always
