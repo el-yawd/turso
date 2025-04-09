@@ -180,9 +180,103 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn bench_execute_select_in(criterion: &mut Criterion) {
+    // https://github.com/tursodatabase/limbo/issues/174
+
+    // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
+
+    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(PlatformIO::new().unwrap());
+
+    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+
+    let limbo_conn = db.connect().unwrap();
+
+    let names = [
+        "('Cindy')",
+        "('Cindy', 'Travis')",
+        "('Cindy', 'Travis', 'Lindsey')",
+        "('Cindy', 'Travis', 'Lindsey', 'Matthew')",
+        "('Cindy', 'Travis', 'Lindsey', 'Matthew', 'Edward')",
+    ];
+
+    let mut group =
+        criterion.benchmark_group("Execute `SELECT * FROM users WHERE first_name IN (...)`");
+
+    for name_list in names.iter() {
+        group.bench_with_input(
+            BenchmarkId::new("limbo_execute_select_in", name_list),
+            name_list,
+            |b, name_list| {
+                let mut stmt = limbo_conn
+                    .prepare(&format!(
+                        "SELECT * FROM users WHERE first_name IN {}",
+                        name_list
+                    ))
+                    .unwrap();
+
+                let io = io.clone();
+
+                b.iter(|| {
+                    loop {
+                        match stmt.step().unwrap() {
+                            limbo_core::StepResult::Row => {
+                                black_box(stmt.row());
+                            }
+
+                            limbo_core::StepResult::IO => {
+                                let _ = io.run_once();
+                            }
+
+                            limbo_core::StepResult::Done => {
+                                break;
+                            }
+
+                            limbo_core::StepResult::Interrupt | limbo_core::StepResult::Busy => {
+                                unreachable!();
+                            }
+                        }
+                    }
+
+                    stmt.reset();
+                });
+            },
+        );
+
+        if enable_rusqlite {
+            let sqlite_conn = rusqlite_open();
+
+            group.bench_with_input(
+                BenchmarkId::new("sqlite_execute_select_in", name_list),
+                name_list,
+                |b, name_list| {
+                    let mut stmt = sqlite_conn
+                        .prepare(&format!(
+                            "SELECT * FROM users WHERE first_name IN {}",
+                            name_list
+                        ))
+                        .unwrap();
+
+                    b.iter(|| {
+                        let mut rows = stmt.raw_query();
+
+                        while let Some(row) = rows.next().unwrap() {
+                            black_box(row);
+                        }
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_prepare_query, bench_execute_select_1, bench_execute_select_rows
+    targets = bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_in
 }
 criterion_main!(benches);
