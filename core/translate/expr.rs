@@ -1,10 +1,14 @@
-use limbo_sqlite3_parser::ast::{self, UnaryOperator};
+use std::sync::Arc;
+
+use limbo_sqlite3_parser::ast::{self, Expr, SortOrder, UnaryOperator};
 
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
-use crate::schema::{Table, Type};
+use crate::schema::{Index, IndexColumn, Table, Type};
 use crate::util::normalize_ident;
+use crate::vdbe::builder::CursorType;
+use crate::vdbe::insn::IdxInsertFlags;
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, Insn},
@@ -333,6 +337,76 @@ pub fn translate_condition_expr(
                 return Ok(());
             }
 
+            if rhs.as_ref().unwrap().len() >= 3 {
+                let rhs: &Vec<ast::Expr> = rhs.as_ref().unwrap();
+                let idx = Arc::new(Index {
+                    name: "".to_string(),
+                    table_name: "".to_string(),
+                    root_page: 0,
+                    columns: vec![IndexColumn {
+                        name: "".to_string(),
+                        order: SortOrder::Asc,
+                    }],
+                    unique: false,
+                });
+            }
+            let cursor_id = program.alloc_cursor_id(None, CursorType::BTreeIndex(idx));
+
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: cursor_id,
+                dest_end: None,
+            });
+
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id,
+                is_btree: false,
+            });
+
+            let rhs_reg = program.alloc_register();
+            let record_reg = program.alloc_register();
+
+            for expr in rhs.iter() {
+                let _ = translate_expr(program, Some(referenced_tables), expr, rhs_reg, resolver)?;
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: rhs_reg,
+                    count: 1,
+                    dest_reg: record_reg,
+                });
+                program.emit_insn(Insn::IdxInsertAsync {
+                    cursor_id,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new().use_seek(true),
+                });
+                program.emit_insn(Insn::NullRow { cursor_id });
+
+                let lhs_reg = program.alloc_register();
+                let _ = translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
+
+                let jump_target_when_true = if condition_metadata.jump_if_condition_is_true {
+                    condition_metadata.jump_target_when_true
+                } else {
+                    program.allocate_label()
+                };
+
+                program.emit_insn(Insn::IsNull {
+                    reg: cursor_id,
+                    target_pc: condition_metadata.jump_target_when_false,
+                });
+                // TODO: Use Affinity
+
+                program.emit_insn(Insn::NotFound {
+                    cursor_id,
+                    target_pc: condition_metadata.jump_target_when_false,
+                    record_reg,
+                    num_regs: 1,
+                });
+
+                program.resolve_label(jump_target_when_true, program.offset());
+
+                return Ok(());
+            }
             // The left hand side only needs to be evaluated once we have a list of values to compare against.
             let lhs_reg = program.alloc_register();
             let _ = translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver)?;
@@ -358,8 +432,13 @@ pub fn translate_condition_expr(
                 for (i, expr) in rhs.iter().enumerate() {
                     let rhs_reg = program.alloc_register();
                     let last_condition = i == rhs.len() - 1;
-                    let _ =
-                        translate_expr(program, Some(referenced_tables), expr, rhs_reg, resolver)?;
+                    let _ = translate_and_mark(
+                        program,
+                        Some(referenced_tables),
+                        expr,
+                        rhs_reg,
+                        resolver,
+                    )?;
                     // If this is not the last condition, we need to jump to the 'jump_target_when_true' label if the condition is true.
                     if !last_condition {
                         program.emit_insn(Insn::Eq {
@@ -389,8 +468,13 @@ pub fn translate_condition_expr(
                 // If it's a NOT IN expression, we need to jump to the 'jump_target_when_false' label if any of the conditions are true.
                 for expr in rhs.iter() {
                     let rhs_reg = program.alloc_register();
-                    let _ =
-                        translate_expr(program, Some(referenced_tables), expr, rhs_reg, resolver)?;
+                    let _ = translate_and_mark(
+                        program,
+                        Some(referenced_tables),
+                        expr,
+                        rhs_reg,
+                        resolver,
+                    )?;
                     program.emit_insn(Insn::Eq {
                         lhs: lhs_reg,
                         rhs: rhs_reg,
