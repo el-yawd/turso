@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::storage::btree::CreateBTreeFlags;
 use crate::vdbe::insn::CmpInsFlags;
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Schema},
-    storage::pager::CreateBTreeFlags,
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},

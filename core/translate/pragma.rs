@@ -7,7 +7,7 @@ use turso_sqlite3_parser::ast::PragmaName;
 use turso_sqlite3_parser::ast::{self, Expr};
 
 use crate::schema::Schema;
-use crate::storage::pager::AutoVacuumMode;
+use crate::storage::btree::AutoVacuumMode;
 use crate::storage::sqlite3_ondisk::MIN_PAGE_CACHE_SIZE;
 use crate::storage::wal::CheckpointMode;
 use crate::util::{normalize_ident, parse_signed_number};
@@ -35,7 +35,6 @@ pub fn translate_pragma(
     schema: &Schema,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
-    pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
@@ -59,15 +58,15 @@ pub fn translate_pragma(
 
     match body {
         None => {
-            query_pragma(pragma, schema, None, pager, connection, &mut program)?;
+            query_pragma(pragma, schema, None, connection, &mut program)?;
         }
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             PragmaName::TableInfo => {
-                query_pragma(pragma, schema, Some(value), pager, connection, &mut program)?;
+                query_pragma(pragma, schema, Some(value), connection, &mut program)?;
             }
             _ => {
                 write = true;
-                update_pragma(pragma, schema, value, pager, connection, &mut program)?;
+                update_pragma(pragma, schema, value, connection, &mut program)?;
             }
         },
     };
@@ -83,7 +82,6 @@ fn update_pragma(
     pragma: PragmaName,
     schema: &Schema,
     value: ast::Expr,
-    pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
@@ -94,18 +92,11 @@ fn update_pragma(
                 Value::Float(size) => size as i64,
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
-            update_cache_size(cache_size, pager, connection)?;
+            update_cache_size(cache_size, connection.btree.pager.clone(), connection)?;
             Ok(())
         }
         PragmaName::JournalMode => {
-            query_pragma(
-                PragmaName::JournalMode,
-                schema,
-                None,
-                pager,
-                connection,
-                program,
-            )?;
+            query_pragma(PragmaName::JournalMode, schema, None, connection, program)?;
             Ok(())
         }
         PragmaName::LegacyFileFormat => Ok(()),
@@ -114,21 +105,13 @@ fn update_pragma(
                 PragmaName::WalCheckpoint,
                 schema,
                 Some(value),
-                pager,
                 connection,
                 program,
             )?;
             Ok(())
         }
         PragmaName::PageCount => {
-            query_pragma(
-                PragmaName::PageCount,
-                schema,
-                None,
-                pager,
-                connection,
-                program,
-            )?;
+            query_pragma(PragmaName::PageCount, schema, None, connection, program)?;
             Ok(())
         }
         PragmaName::UserVersion => {
@@ -182,9 +165,15 @@ fn update_pragma(
                 }
             };
             match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
+                0 => connection
+                    .btree
+                    .update_auto_vacuum_mode(AutoVacuumMode::None, 0)?,
+                1 => connection
+                    .btree
+                    .update_auto_vacuum_mode(AutoVacuumMode::Full, 1)?,
+                2 => connection
+                    .btree
+                    .update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1)?,
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
@@ -224,7 +213,6 @@ fn query_pragma(
     pragma: PragmaName,
     schema: &Schema,
     value: Option<ast::Expr>,
-    pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
@@ -341,7 +329,7 @@ fn query_pragma(
         }
         PragmaName::PageSize => {
             program.emit_int(
-                header_accessor::get_page_size(&pager)
+                header_accessor::get_page_size(&connection.btree.pager)
                     .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64,
                 register,
             );
@@ -349,7 +337,7 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
         }
         PragmaName::AutoVacuum => {
-            let auto_vacuum_mode = pager.get_auto_vacuum_mode();
+            let auto_vacuum_mode = connection.btree.get_auto_vacuum_mode();
             let auto_vacuum_mode_i64: i64 = match auto_vacuum_mode {
                 AutoVacuumMode::None => 0,
                 AutoVacuumMode::Full => 1,
@@ -369,16 +357,6 @@ fn query_pragma(
         }
     }
 
-    Ok(())
-}
-
-fn update_auto_vacuum_mode(
-    auto_vacuum_mode: AutoVacuumMode,
-    largest_root_page_number: u32,
-    pager: Rc<Pager>,
-) -> crate::Result<()> {
-    header_accessor::set_vacuum_mode_largest_root_page(&pager, largest_root_page_number)?;
-    pager.set_auto_vacuum_mode(auto_vacuum_mode);
     Ok(())
 }
 

@@ -4,9 +4,8 @@ use crate::{
         pager::{PageRef, Pager},
         sqlite3_ondisk::DATABASE_HEADER_PAGE_ID,
     },
-    LimboError, Result,
+    Result,
 };
-use std::sync::atomic::Ordering;
 
 // const HEADER_OFFSET_MAGIC: usize = 0;
 const HEADER_OFFSET_PAGE_SIZE: usize = 16;
@@ -34,11 +33,6 @@ const HEADER_OFFSET_VERSION_NUMBER: usize = 96;
 
 // Helper to get a read-only reference to the header page.
 fn get_header_page(pager: &Pager) -> Result<PageRef> {
-    if pager.is_empty.load(Ordering::SeqCst) < 2 {
-        return Err(LimboError::InternalError(
-            "Database is empty, header does not exist - page 1 should've been allocated before this".to_string(),
-        ));
-    }
     let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
     while !page.is_loaded() || page.is_locked() {
         // FIXME: LETS STOP DOING THESE SYNCHRONOUS IO HACKS
@@ -49,12 +43,6 @@ fn get_header_page(pager: &Pager) -> Result<PageRef> {
 
 // Helper to get a writable reference to the header page and mark it dirty.
 fn get_header_page_for_write(pager: &Pager) -> Result<PageRef> {
-    if pager.is_empty.load(Ordering::SeqCst) < 2 {
-        // This should not be called on an empty DB for writing, as page 1 is allocated on first transaction.
-        return Err(LimboError::InternalError(
-            "Cannot write to header of an empty database - page 1 should've been allocated before this".to_string(),
-        ));
-    }
     let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
     while !page.is_loaded() || page.is_locked() {
         // FIXME: LETS STOP DOING THESE SYNCHRONOUS IO HACKS
@@ -88,9 +76,6 @@ macro_rules! impl_header_field_accessor {
         paste::paste! {
             #[allow(dead_code)]
             pub fn [<get_ $field_name>](pager: &Pager) -> Result<$type> {
-                if pager.is_empty.load(Ordering::SeqCst) < 2 {
-                    return Err(LimboError::InternalError(format!("Database is empty, header does not exist - page 1 should've been allocated before this")));
-                }
                 let page = get_header_page(pager)?;
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();

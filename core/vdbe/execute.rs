@@ -2,11 +2,12 @@
 use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Schema;
-use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
+use crate::storage::btree::{BTree, CreateBTreeFlags};
+use crate::storage::btree_cursor::{
+    integrity_check, BTreeCursor, BTreeKey, IntegrityCheckError, IntegrityCheckState,
+};
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
-use crate::storage::pager::CreateBTreeFlags;
-use crate::storage::wal::DummyWAL;
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{ImmutableRecord, Text};
@@ -25,16 +26,11 @@ use crate::{
     },
     types::compare_immutable,
 };
-use std::sync::atomic::AtomicUsize;
-use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
 
 use crate::{pseudo::PseudoCursor, result::LimboResult};
 
-use crate::{
-    schema::{affinity, Affinity},
-    storage::btree::{BTreeCursor, BTreeKey},
-};
+use crate::schema::{affinity, Affinity};
 
 use crate::{
     storage::wal::CheckpointResult,
@@ -86,9 +82,7 @@ use crate::{
 };
 
 use super::{get_new_rowid, make_record, Program, ProgramState, Register};
-use crate::{
-    bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Pager, Result,
-};
+use crate::{bail_constraint_error, must_be_btree_cursor, resolve_ext_path, MvStore, Result};
 
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -102,7 +96,7 @@ pub type InsnFunction = fn(
     &Program,
     &mut ProgramState,
     &Insn,
-    &Rc<Pager>,
+    &Rc<BTree>,
     Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult>;
 
@@ -119,7 +113,7 @@ pub fn op_init(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Init { target_pc } = insn else {
@@ -134,7 +128,7 @@ pub fn op_add(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Add { lhs, rhs, dest } = insn else {
@@ -153,7 +147,7 @@ pub fn op_subtract(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Subtract { lhs, rhs, dest } = insn else {
@@ -172,7 +166,7 @@ pub fn op_multiply(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Multiply { lhs, rhs, dest } = insn else {
@@ -191,7 +185,7 @@ pub fn op_divide(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Divide { lhs, rhs, dest } = insn else {
@@ -210,7 +204,7 @@ pub fn op_drop_index(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DropIndex { index, db: _ } = insn else {
@@ -226,7 +220,7 @@ pub fn op_remainder(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Remainder { lhs, rhs, dest } = insn else {
@@ -245,7 +239,7 @@ pub fn op_bit_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::BitAnd { lhs, rhs, dest } = insn else {
@@ -264,7 +258,7 @@ pub fn op_bit_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::BitOr { lhs, rhs, dest } = insn else {
@@ -283,7 +277,7 @@ pub fn op_bit_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::BitNot { reg, dest } = insn else {
@@ -299,7 +293,7 @@ pub fn op_checkpoint(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Checkpoint {
@@ -336,7 +330,7 @@ pub fn op_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     match insn {
@@ -359,7 +353,7 @@ pub fn op_null_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NullRow { cursor_id } = insn else {
@@ -378,7 +372,7 @@ pub fn op_compare(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Compare {
@@ -424,7 +418,7 @@ pub fn op_jump(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Jump {
@@ -457,7 +451,7 @@ pub fn op_move(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Move {
@@ -485,7 +479,7 @@ pub fn op_if_pos(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IfPos {
@@ -520,7 +514,7 @@ pub fn op_not_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NotNull { reg, target_pc } = insn else {
@@ -607,7 +601,7 @@ pub fn op_comparison(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (lhs, rhs, target_pc, flags, collation, op) = match insn {
@@ -814,7 +808,7 @@ pub fn op_if(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::If {
@@ -841,7 +835,7 @@ pub fn op_if_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IfNot {
@@ -868,7 +862,7 @@ pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OpenRead {
@@ -893,7 +887,7 @@ pub fn op_open_read(
     let mut cursors = state.cursors.borrow_mut();
     match cursor_type {
         CursorType::BTreeTable(_) => {
-            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page);
+            let cursor = BTreeCursor::new_table(mv_cursor, btree.clone(), *root_page);
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
@@ -921,7 +915,7 @@ pub fn op_open_read(
             });
             let cursor = BTreeCursor::new_index(
                 mv_cursor,
-                pager.clone(),
+                btree.clone(),
                 *root_page,
                 index.as_ref(),
                 collations,
@@ -949,7 +943,7 @@ pub fn op_vopen(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VOpen { cursor_id } = insn else {
@@ -974,7 +968,7 @@ pub fn op_vcreate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VCreate {
@@ -1015,7 +1009,7 @@ pub fn op_vfilter(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VFilter {
@@ -1055,7 +1049,7 @@ pub fn op_vcolumn(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VColumn {
@@ -1080,7 +1074,7 @@ pub fn op_vupdate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VUpdate {
@@ -1142,7 +1136,7 @@ pub fn op_vnext(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VNext {
@@ -1169,7 +1163,7 @@ pub fn op_vdestroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::VDestroy { db, table_name } = insn else {
@@ -1193,7 +1187,7 @@ pub fn op_open_pseudo(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OpenPseudo {
@@ -1220,7 +1214,7 @@ pub fn op_rewind(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Rewind {
@@ -1249,7 +1243,7 @@ pub fn op_last(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Last {
@@ -1278,7 +1272,7 @@ pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Column {
@@ -1396,7 +1390,7 @@ pub fn op_type_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::TypeCheck {
@@ -1458,7 +1452,7 @@ pub fn op_make_record(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::MakeRecord {
@@ -1480,7 +1474,7 @@ pub fn op_result_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ResultRow { start_reg, count } = insn else {
@@ -1499,7 +1493,7 @@ pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Next {
@@ -1530,7 +1524,7 @@ pub fn op_prev(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Prev {
@@ -1560,14 +1554,14 @@ pub fn op_prev(
 pub fn halt(
     program: &Program,
     state: &mut ProgramState,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
     err_code: usize,
     description: &str,
 ) -> Result<InsnFunctionStepResult> {
     if err_code > 0 {
         // invalidate page cache in case of error
-        pager.clear_page_cache();
+        btree.pager.clear_page_cache();
     }
     match err_code {
         0 => {}
@@ -1590,7 +1584,7 @@ pub fn halt(
             )));
         }
     }
-    match program.commit_txn(pager.clone(), state, mv_store, false)? {
+    match program.commit_txn(btree.pager.clone(), state, mv_store, false)? {
         StepResult::Done => Ok(InsnFunctionStepResult::Done),
         StepResult::IO => Ok(InsnFunctionStepResult::IO),
         StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1603,7 +1597,7 @@ pub fn op_halt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Halt {
@@ -1615,7 +1609,7 @@ pub fn op_halt(
     };
     if *err_code > 0 {
         // invalidate page cache in case of error
-        pager.clear_page_cache();
+        btree.pager.clear_page_cache();
     }
     match *err_code {
         0 => {}
@@ -1641,7 +1635,7 @@ pub fn op_halt(
     let auto_commit = program.connection.auto_commit.get();
     tracing::trace!("op_halt(auto_commit={})", auto_commit);
     if auto_commit {
-        match program.commit_txn(pager.clone(), state, mv_store, false)? {
+        match program.commit_txn(btree.pager.clone(), state, mv_store, false)? {
             StepResult::Done => Ok(InsnFunctionStepResult::Done),
             StepResult::IO => Ok(InsnFunctionStepResult::IO),
             StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1657,7 +1651,7 @@ pub fn op_halt_if_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::HaltIfNull {
@@ -1669,7 +1663,7 @@ pub fn op_halt_if_null(
         unreachable!("unexpected Insn {:?}", insn)
     };
     if state.registers[*target_reg].get_owned_value() == &Value::Null {
-        halt(program, state, pager, mv_store, *err_code, description)
+        halt(program, state, btree, mv_store, *err_code, description)
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
@@ -1680,7 +1674,7 @@ pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Transaction { write } = insn else {
@@ -1709,14 +1703,14 @@ pub fn op_transaction(
         };
 
         if updated && matches!(current_state, TransactionState::None) {
-            if let LimboResult::Busy = return_if_io!(pager.begin_read_tx()) {
+            if let LimboResult::Busy = return_if_io!(btree.pager.begin_read_tx()) {
                 return Ok(InsnFunctionStepResult::Busy);
             }
         }
 
         if updated && matches!(new_transaction_state, TransactionState::Write) {
-            if let LimboResult::Busy = return_if_io!(pager.begin_write_tx()) {
-                pager.end_read_tx()?;
+            if let LimboResult::Busy = return_if_io!(btree.pager.begin_write_tx()) {
+                btree.pager.end_read_tx()?;
                 tracing::trace!("begin_write_tx busy");
                 return Ok(InsnFunctionStepResult::Busy);
             }
@@ -1733,7 +1727,7 @@ pub fn op_auto_commit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::AutoCommit {
@@ -1745,7 +1739,7 @@ pub fn op_auto_commit(
     };
     let conn = program.connection.clone();
     if state.commit_state == CommitState::Committing {
-        return match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
+        return match program.commit_txn(btree.pager.clone(), state, mv_store, *rollback)? {
             super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
             super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
             super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1757,7 +1751,7 @@ pub fn op_auto_commit(
     if *auto_commit != conn.auto_commit.get() {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
-            pager.rollback()?;
+            btree.pager.rollback()?;
             conn.auto_commit.replace(true);
         } else {
             conn.auto_commit.replace(*auto_commit);
@@ -1775,7 +1769,7 @@ pub fn op_auto_commit(
             "cannot commit - no transaction is active".to_string(),
         ));
     }
-    match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
+    match program.commit_txn(btree.pager.clone(), state, mv_store, *rollback)? {
         super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
         super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
         super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
@@ -1788,7 +1782,7 @@ pub fn op_goto(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Goto { target_pc } = insn else {
@@ -1803,7 +1797,7 @@ pub fn op_gosub(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Gosub {
@@ -1823,7 +1817,7 @@ pub fn op_return(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Return {
@@ -1853,7 +1847,7 @@ pub fn op_integer(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Integer { value, dest } = insn else {
@@ -1868,7 +1862,7 @@ pub fn op_real(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Real { value, dest } = insn else {
@@ -1883,7 +1877,7 @@ pub fn op_real_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::RealAffinity { register } = insn else {
@@ -1900,7 +1894,7 @@ pub fn op_string8(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::String8 { value, dest } = insn else {
@@ -1915,7 +1909,7 @@ pub fn op_blob(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Blob { value, dest } = insn else {
@@ -1930,7 +1924,7 @@ pub fn op_row_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::RowData { cursor_id, dest } = insn else {
@@ -1961,7 +1955,7 @@ pub fn op_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::RowId { cursor_id, dest } = insn else {
@@ -2024,7 +2018,7 @@ pub fn op_idx_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxRowId { cursor_id, dest } = insn else {
@@ -2046,7 +2040,7 @@ pub fn op_seek_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SeekRowid {
@@ -2102,7 +2096,7 @@ pub fn op_deferred_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DeferredSeek {
@@ -2121,7 +2115,7 @@ pub fn op_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (Insn::SeekGE {
@@ -2293,7 +2287,7 @@ pub fn op_idx_ge(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxGE {
@@ -2339,7 +2333,7 @@ pub fn op_seek_end(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     if let Insn::SeekEnd { cursor_id } = *insn {
@@ -2357,7 +2351,7 @@ pub fn op_idx_le(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxLE {
@@ -2403,7 +2397,7 @@ pub fn op_idx_gt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxGT {
@@ -2449,7 +2443,7 @@ pub fn op_idx_lt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxLT {
@@ -2495,7 +2489,7 @@ pub fn op_decr_jump_zero(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DecrJumpZero { reg, target_pc } = insn else {
@@ -2521,7 +2515,7 @@ pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::AggStep {
@@ -2830,7 +2824,7 @@ pub fn op_agg_final(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::AggFinal { register, func } = insn else {
@@ -2953,7 +2947,7 @@ pub fn op_sorter_open(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterOpen {
@@ -2985,7 +2979,7 @@ pub fn op_sorter_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterData {
@@ -3021,7 +3015,7 @@ pub fn op_sorter_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterInsert {
@@ -3048,7 +3042,7 @@ pub fn op_sorter_sort(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterSort {
@@ -3079,7 +3073,7 @@ pub fn op_sorter_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SorterNext {
@@ -3108,7 +3102,7 @@ pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Function {
@@ -3700,7 +3694,8 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SqliteVersion => {
-                let version_integer: i64 = header_accessor::get_version_number(pager)? as i64;
+                let version_integer: i64 =
+                    header_accessor::get_version_number(&btree.pager)? as i64;
                 let version = execute_sqlite_version(version_integer);
                 state.registers[*dest] = Register::Value(Value::build_text(version));
             }
@@ -4140,7 +4135,7 @@ pub fn op_init_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::InitCoroutine {
@@ -4168,7 +4163,7 @@ pub fn op_end_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::EndCoroutine { yield_reg } = insn else {
@@ -4190,7 +4185,7 @@ pub fn op_yield(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Yield {
@@ -4225,7 +4220,7 @@ pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Insert {
@@ -4279,7 +4274,7 @@ pub fn op_int_64(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Int64 {
@@ -4300,7 +4295,7 @@ pub fn op_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Delete { cursor_id } = insn else {
@@ -4327,7 +4322,7 @@ pub fn op_idx_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IdxDelete {
@@ -4408,7 +4403,7 @@ pub fn op_idx_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     if let Insn::IdxInsert {
@@ -4480,7 +4475,7 @@ pub fn op_new_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NewRowid {
@@ -4504,7 +4499,7 @@ pub fn op_must_be_int(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::MustBeInt { reg } = insn else {
@@ -4539,7 +4534,7 @@ pub fn op_soft_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SoftNull { reg } = insn else {
@@ -4554,7 +4549,7 @@ pub fn op_no_conflict(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NoConflict {
@@ -4608,7 +4603,7 @@ pub fn op_not_exists(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::NotExists {
@@ -4636,7 +4631,7 @@ pub fn op_offset_limit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OffsetLimit {
@@ -4681,7 +4676,7 @@ pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::OpenWrite {
@@ -4745,7 +4740,7 @@ pub fn op_open_write(
         });
         let cursor = BTreeCursor::new_index(
             mv_cursor,
-            pager.clone(),
+            btree.clone(),
             root_page as usize,
             index.as_ref(),
             collations,
@@ -4755,7 +4750,7 @@ pub fn op_open_write(
             .unwrap()
             .replace(Cursor::new_btree(cursor));
     } else {
-        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize);
+        let cursor = BTreeCursor::new_table(mv_cursor, btree.clone(), root_page as usize);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -4769,7 +4764,7 @@ pub fn op_copy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Copy {
@@ -4791,7 +4786,7 @@ pub fn op_create_btree(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::CreateBtree { db, root, flags } = insn else {
@@ -4805,7 +4800,7 @@ pub fn op_create_btree(
         todo!("temp databases not implemented yet");
     }
     // FIXME: handle page cache is full
-    let root_page = return_if_io!(pager.btree_create(flags));
+    let root_page = return_if_io!(btree.create(flags));
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4815,7 +4810,7 @@ pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Destroy {
@@ -4830,7 +4825,7 @@ pub fn op_destroy(
         todo!("temp databases not implemented yet.");
     }
     // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
-    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, Vec::new());
+    let mut cursor = BTreeCursor::new(None, btree.clone(), *root, Vec::new());
     let former_root_page_result = cursor.btree_destroy()?;
     if let CursorResult::Ok(former_root_page) = former_root_page_result {
         state.registers[*former_root_reg] =
@@ -4844,7 +4839,7 @@ pub fn op_drop_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::DropTable { db, table_name, .. } = insn else {
@@ -4867,7 +4862,7 @@ pub fn op_close(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Close { cursor_id } = insn else {
@@ -4883,7 +4878,7 @@ pub fn op_is_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IsNull { reg, target_pc } = insn else {
@@ -4901,7 +4896,7 @@ pub fn op_page_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::PageCount { db, dest } = insn else {
@@ -4911,7 +4906,7 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = header_accessor::get_database_size(pager)?.into();
+    let count = header_accessor::get_database_size(&btree.pager)?.into();
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4921,7 +4916,7 @@ pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ParseSchema {
@@ -4946,7 +4941,7 @@ pub fn op_parse_schema(
             parse_schema_rows(
                 Some(stmt),
                 &mut schema,
-                conn.pager.io.clone(),
+                conn.btree.io.clone(),
                 &conn.syms.borrow(),
                 state.mv_tx_id,
             )?;
@@ -4960,7 +4955,7 @@ pub fn op_parse_schema(
             parse_schema_rows(
                 Some(stmt),
                 &mut new,
-                conn.pager.io.clone(),
+                conn.btree.io.clone(),
                 &conn.syms.borrow(),
                 state.mv_tx_id,
             )?;
@@ -4977,7 +4972,7 @@ pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ReadCookie { db, dest, cookie } = insn else {
@@ -4988,10 +4983,10 @@ pub fn op_read_cookie(
         todo!("temp databases not implemented yet");
     }
     let cookie_value = match cookie {
-        Cookie::UserVersion => header_accessor::get_user_version(pager)?.into(),
-        Cookie::SchemaVersion => header_accessor::get_schema_cookie(pager)?.into(),
+        Cookie::UserVersion => header_accessor::get_user_version(&btree.pager)?.into(),
+        Cookie::SchemaVersion => header_accessor::get_schema_cookie(&btree.pager)?.into(),
         Cookie::LargestRootPageNumber => {
-            header_accessor::get_vacuum_mode_largest_root_page(pager)?.into()
+            header_accessor::get_vacuum_mode_largest_root_page(&btree.pager)?.into()
         }
         cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
     };
@@ -5004,7 +4999,7 @@ pub fn op_set_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::SetCookie {
@@ -5021,13 +5016,13 @@ pub fn op_set_cookie(
     }
     match cookie {
         Cookie::UserVersion => {
-            header_accessor::set_user_version(pager, *value)?;
+            header_accessor::set_user_version(&btree.pager, *value)?;
         }
         Cookie::LargestRootPageNumber => {
-            header_accessor::set_vacuum_mode_largest_root_page(pager, *value as u32)?;
+            header_accessor::set_vacuum_mode_largest_root_page(&btree.pager, *value as u32)?;
         }
         Cookie::IncrementalVacuum => {
-            header_accessor::set_incremental_vacuum_enabled(pager, *value as u32)?;
+            header_accessor::set_incremental_vacuum_enabled(&btree.pager, *value as u32)?;
         }
         cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
     }
@@ -5039,7 +5034,7 @@ pub fn op_shift_right(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ShiftRight { lhs, rhs, dest } = insn else {
@@ -5058,7 +5053,7 @@ pub fn op_shift_left(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ShiftLeft { lhs, rhs, dest } = insn else {
@@ -5077,7 +5072,7 @@ pub fn op_variable(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Variable { index, dest } = insn else {
@@ -5092,7 +5087,7 @@ pub fn op_zero_or_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::ZeroOrNull { rg1, rg2, dest } = insn else {
@@ -5113,7 +5108,7 @@ pub fn op_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Not { reg, dest } = insn else {
@@ -5129,7 +5124,7 @@ pub fn op_concat(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Concat { lhs, rhs, dest } = insn else {
@@ -5148,7 +5143,7 @@ pub fn op_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::And { lhs, rhs, dest } = insn else {
@@ -5167,7 +5162,7 @@ pub fn op_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Or { lhs, rhs, dest } = insn else {
@@ -5186,7 +5181,7 @@ pub fn op_noop(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     // Do nothing
@@ -5195,16 +5190,11 @@ pub fn op_noop(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub enum OpOpenEphemeralState {
-    Start,
-    StartingTxn { pager: Rc<Pager> },
-    CreateBtree { pager: Rc<Pager> },
-}
 pub fn op_open_ephemeral(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, is_table) = match insn {
@@ -5215,113 +5205,88 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    match &state.op_open_ephemeral_state {
-        OpOpenEphemeralState::Start => {
-            tracing::trace!("Start");
-            let conn = program.connection.clone();
-            let io = conn.pager.io.get_memory_io();
+    let conn = program.connection.clone();
+    let io = conn.btree.io.get_memory_io();
 
-            let file = io.open_file("", OpenFlags::Create, true)?;
-            let db_file = Arc::new(FileMemoryStorage::new(file));
+    let file = io.open_file("", OpenFlags::Create, true)?;
+    let db_file = Arc::new(FileMemoryStorage::new(file));
 
-            let buffer_pool = Rc::new(BufferPool::new(None));
-            let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
+    let buffer_pool = Rc::new(BufferPool::new(None));
+    let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
-            let pager = Rc::new(Pager::new(
-                db_file,
-                Rc::new(RefCell::new(DummyWAL)),
-                io,
-                page_cache,
-                buffer_pool.clone(),
-                Arc::new(AtomicUsize::new(0)),
-                Arc::new(Mutex::new(())),
-            )?);
+    let btree = BTree::open(io.clone(), None, db_file.clone())?;
 
-            let page_size = header_accessor::get_page_size(&pager)
-                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-                as usize;
-            buffer_pool.set_page_size(page_size);
+    let page_size = header_accessor::get_page_size(&btree.pager)
+        .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as usize;
+    buffer_pool.set_page_size(page_size);
 
-            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
+    return_if_io!(btree.pager.begin_write_tx());
+
+    // FIXME: handle page cache is full
+    let flag = if is_table {
+        &CreateBTreeFlags::new_table()
+    } else {
+        &CreateBTreeFlags::new_index()
+    };
+    let root_page = return_if_io!(btree.create(flag));
+
+    let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
+    let mv_cursor = match state.mv_tx_id {
+        Some(tx_id) => {
+            let table_id = root_page as u64;
+            let mv_store = mv_store.unwrap().clone();
+            let mv_cursor = Rc::new(RefCell::new(
+                MvCursor::new(mv_store.clone(), tx_id, table_id).unwrap(),
+            ));
+            Some(mv_cursor)
         }
-        OpOpenEphemeralState::StartingTxn { pager } => {
-            tracing::trace!("StartingTxn");
-            return_if_io!(pager.begin_write_tx());
-            state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
-                pager: pager.clone(),
-            };
+        None => None,
+    };
+    let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
+        BTreeCursor::new_index(
+            mv_cursor,
+            btree.clone(),
+            root_page as usize,
+            index,
+            index
+                .columns
+                .iter()
+                .map(|c| c.collation.unwrap_or_default())
+                .collect(),
+        )
+    } else {
+        BTreeCursor::new_table(mv_cursor, btree.clone(), root_page as usize)
+    };
+    cursor.rewind()?; // Will never return io
+
+    let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> = state.cursors.borrow_mut();
+
+    // Table content is erased if the cursor already exists
+    match cursor_type {
+        CursorType::BTreeTable(_) => {
+            cursors
+                .get_mut(cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
         }
-        OpOpenEphemeralState::CreateBtree { pager } => {
-            tracing::trace!("CreateBtree");
-            // FIXME: handle page cache is full
-            let flag = if is_table {
-                &CreateBTreeFlags::new_table()
-            } else {
-                &CreateBTreeFlags::new_index()
-            };
-            let root_page = return_if_io!(pager.btree_create(flag));
-
-            let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = match state.mv_tx_id {
-                Some(tx_id) => {
-                    let table_id = root_page as u64;
-                    let mv_store = mv_store.unwrap().clone();
-                    let mv_cursor = Rc::new(RefCell::new(
-                        MvCursor::new(mv_store.clone(), tx_id, table_id).unwrap(),
-                    ));
-                    Some(mv_cursor)
-                }
-                None => None,
-            };
-            let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(
-                    mv_cursor,
-                    pager.clone(),
-                    root_page as usize,
-                    index,
-                    index
-                        .columns
-                        .iter()
-                        .map(|c| c.collation.unwrap_or_default())
-                        .collect(),
-                )
-            } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize)
-            };
-            cursor.rewind()?; // Will never return io
-
-            let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> =
-                state.cursors.borrow_mut();
-
-            // Table content is erased if the cursor already exists
-            match cursor_type {
-                CursorType::BTreeTable(_) => {
-                    cursors
-                        .get_mut(cursor_id)
-                        .unwrap()
-                        .replace(Cursor::new_btree(cursor));
-                }
-                CursorType::BTreeIndex(_) => {
-                    cursors
-                        .get_mut(cursor_id)
-                        .unwrap()
-                        .replace(Cursor::new_btree(cursor));
-                }
-                CursorType::Pseudo(_) => {
-                    panic!("OpenEphemeral on pseudo cursor");
-                }
-                CursorType::Sorter => {
-                    panic!("OpenEphemeral on sorter cursor");
-                }
-                CursorType::VirtualTable(_) => {
-                    panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
-                }
-            }
-
-            state.pc += 1;
-            state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+        CursorType::BTreeIndex(_) => {
+            cursors
+                .get_mut(cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        }
+        CursorType::Pseudo(_) => {
+            panic!("OpenEphemeral on pseudo cursor");
+        }
+        CursorType::Sorter => {
+            panic!("OpenEphemeral on sorter cursor");
+        }
+        CursorType::VirtualTable(_) => {
+            panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
         }
     }
+
+    state.pc += 1;
 
     Ok(InsnFunctionStepResult::Step)
 }
@@ -5334,7 +5299,7 @@ pub fn op_once(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Once {
@@ -5358,7 +5323,7 @@ pub fn op_found(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, target_pc, record_reg, num_regs) = match insn {
@@ -5414,7 +5379,7 @@ pub fn op_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Affinity {
@@ -5448,7 +5413,7 @@ pub fn op_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::Count {
@@ -5485,7 +5450,7 @@ pub fn op_integrity_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    btree: &Rc<BTree>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::IntegrityCk {
@@ -5509,7 +5474,7 @@ pub fn op_integrity_check(
             current_root_idx,
             state: integrity_check_state,
         } => {
-            return_if_io!(integrity_check(integrity_check_state, errors, pager));
+            return_if_io!(integrity_check(integrity_check_state, errors, btree));
             *current_root_idx += 1;
             if *current_root_idx < roots.len() {
                 *integrity_check_state = IntegrityCheckState::new(roots[*current_root_idx]);
