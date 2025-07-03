@@ -72,6 +72,7 @@ use std::{
     sync::Arc,
 };
 use storage::btree::BTree;
+use storage::pager::{DB_STATE_INITIALIZED, DB_STATE_UNITIALIZED};
 
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
@@ -110,6 +111,9 @@ pub struct Database {
     mv_store: Option<Rc<MvStore>>,
     schema: Arc<RwLock<Schema>>,
     db_file: Arc<dyn DatabaseStorage>,
+    // Shared structures of a Database are the parts that are common to multiple threads that might
+    // create DB connections.
+    _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
     path: String,
     io: Arc<dyn IO>,
     maybe_shared_wal: RwLock<Option<Arc<UnsafeCell<WalFileShared>>>>,
@@ -186,11 +190,19 @@ impl Database {
             unsafe { &*wal.get() }.max_frame.load(Ordering::SeqCst) > 0
         });
 
+        let is_empty = if db_size == 0 && !wal_has_frames {
+            DB_STATE_UNITIALIZED
+        } else {
+            DB_STATE_INITIALIZED
+        };
+
+        let shared_page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
         let schema = Arc::new(RwLock::new(Schema::new(enable_indexes)));
         let db = Database {
             mv_store,
             path: path.to_string(),
             schema: schema.clone(),
+            _shared_page_cache: shared_page_cache.clone(),
             maybe_shared_wal: RwLock::new(maybe_shared_wal),
             db_file,
             io: io.clone(),
@@ -199,19 +211,23 @@ impl Database {
         let db = Arc::new(db);
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-        // parse schema
-        let conn = db.connect()?;
-        let rows = conn.query("SELECT * FROM sqlite_schema")?;
-        let mut schema = schema
-            .try_write()
-            .expect("lock on schema should succeed first try");
-        let syms = conn.syms.borrow();
-        if let Err(LimboError::ExtensionError(e)) =
-            parse_schema_rows(rows, &mut schema, io, &syms, None)
-        {
-            // this means that a vtab exists and we no longer have the module loaded. we print
-            // a warning to the user to load the module
-            eprintln!("Warning: {}", e);
+        if is_empty == 2 {
+            // parse schema
+            let conn = db.connect()?;
+            let schema_version = get_schema_version(&conn, &io)?;
+            schema.write().schema_version = schema_version;
+            let rows = conn.query("SELECT * FROM sqlite_schema")?;
+            let mut schema = schema
+                .try_write()
+                .expect("lock on schema should succeed first try");
+            let syms = conn.syms.borrow();
+            if let Err(LimboError::ExtensionError(e)) =
+                parse_schema_rows(rows, &mut schema, io, &syms, None)
+            {
+                // this means that a vtab exists and we no longer have the module loaded. we print
+                // a warning to the user to load the module
+                eprintln!("Warning: {}", e);
+            }
         }
         Ok(db)
     }
@@ -360,6 +376,50 @@ impl Database {
                 };
                 let db = Self::open_file_with_flags(io.clone(), path, flags, indexes, mvcc)?;
                 Ok((io, db))
+            }
+        }
+    }
+}
+
+fn get_schema_version(conn: &Arc<Connection>, io: &Arc<dyn IO>) -> Result<u32> {
+    let mut rows = conn
+        .query("PRAGMA schema_version")?
+        .ok_or(LimboError::InternalError(
+            "failed to parse pragma schema_version on initialization".to_string(),
+        ))?;
+    let mut schema_version = None;
+    loop {
+        match rows.step()? {
+            StepResult::Row => {
+                let row = rows.row().unwrap();
+                if schema_version.is_some() {
+                    return Err(LimboError::InternalError(
+                        "PRAGMA schema_version; returned more that one row".to_string(),
+                    ));
+                }
+                schema_version = Some(row.get::<i64>(0)? as u32);
+            }
+            StepResult::IO => {
+                io.run_once()?;
+            }
+            StepResult::Interrupt => {
+                return Err(LimboError::InternalError(
+                    "PRAGMA schema_version; returned more that one row".to_string(),
+                ));
+            }
+            StepResult::Done => {
+                if let Some(version) = schema_version {
+                    return Ok(version);
+                } else {
+                    return Err(LimboError::InternalError(
+                        "failed to get schema_version".to_string(),
+                    ));
+                }
+            }
+            StepResult::Busy => {
+                return Err(LimboError::InternalError(
+                    "PRAGMA schema_version; returned more that one row".to_string(),
+                ));
             }
         }
     }

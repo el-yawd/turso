@@ -153,8 +153,6 @@ pub struct BTree {
     pub io: Arc<dyn IO>,
     /// List of all open cursors
     cursors: Vec<Arc<BTreeCursor>>,
-    /// First page of the database
-    page1: Option<PageRef>,
     n_pages: usize,
     inTransaction: InTransaction,
     auto_vacuum_mode: RefCell<AutoVacuumMode>,
@@ -194,17 +192,15 @@ impl BTree {
             let page_size = header_accessor::get_page_size(&pager)
                 .unwrap_or(crate::storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
                 as u32;
-            let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
-                .unwrap_or(crate::storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
+
             pager.buffer_pool.set_page_size(page_size as usize);
 
             return Ok(Rc::new(Self {
                 pager,
                 io,
-                cursors: todo!(),
-                page1: todo!(),
-                n_pages: todo!(),
-                inTransaction: todo!(),
+                cursors: Vec::new(),
+                n_pages: 0,
+                inTransaction: InTransaction::None,
                 auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
                 page_size: OnceCell::new(),
                 reserved_space: OnceCell::new(),
@@ -221,19 +217,13 @@ impl BTree {
             Arc::new(RwLock::new(DumbLruPageCache::default())),
             buffer_pool.clone(),
         )?);
-        let page_size = header_accessor::get_page_size(&pager)
-            .unwrap_or(crate::storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-            as u32;
-        let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
-            .unwrap_or(crate::storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
 
         Ok(Rc::new(Self {
             pager,
             io,
-            cursors: todo!(),
-            page1: todo!(),
-            n_pages: todo!(),
-            inTransaction: todo!(),
+            cursors: Vec::new(),
+            n_pages: 0,
+            inTransaction: InTransaction::None,
 
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
             page_size: OnceCell::new(),
@@ -251,7 +241,7 @@ impl BTree {
     }
 
     /// This method is used to allocate a new root page for a btree, both for tables and indexes
-    /// FIXME: handle no room in page cache
+    // FIXME: handle no room in page cache
     pub fn create(&self, flags: &CreateBTreeFlags) -> Result<CursorResult<u32>> {
         let page_type = match flags {
             _ if flags.is_table() => PageType::TableLeaf,

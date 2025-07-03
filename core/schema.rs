@@ -23,6 +23,7 @@ pub struct Schema {
     pub indexes: HashMap<String, Vec<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
     pub indexes_enabled: bool,
+    pub schema_version: u32,
 }
 
 impl Schema {
@@ -40,6 +41,7 @@ impl Schema {
             indexes,
             has_indexes,
             indexes_enabled,
+            schema_version: 0,
         }
     }
 

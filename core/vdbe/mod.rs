@@ -42,7 +42,10 @@ use crate::{
 use crate::json::JsonCacheCell;
 use crate::{Connection, MvStore, Result, TransactionState};
 use builder::CursorKey;
-use execute::{InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState};
+use execute::{
+    InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
+    OpOpenEphemeralState,
+};
 
 use rand::Rng;
 use regex::Regex;
@@ -246,6 +249,7 @@ pub struct ProgramState {
     json_cache: JsonCacheCell,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
+    op_open_ephemeral_state: OpOpenEphemeralState,
 }
 
 impl ProgramState {
@@ -271,6 +275,7 @@ impl ProgramState {
             json_cache: JsonCacheCell::new(),
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
+            op_open_ephemeral_state: OpOpenEphemeralState::Start,
         }
     }
 
