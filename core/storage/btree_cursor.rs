@@ -5,7 +5,7 @@ use crate::{
     storage::{
         btree::{offset, BTree, BTreePageInner},
         header_accessor,
-        pager::BtreePageAllocMode,
+        pager::{BtreePageAllocMode, DB_STATE_INITIALIZED, DB_STATE_UNITIALIZED},
         sqlite3_ondisk::{
             read_u32, read_varint, BTreeCell, PageContent, PageType, TableInteriorCell,
             TableLeafCell,
@@ -6434,12 +6434,22 @@ mod tests {
     use super::*;
     use crate::{
         io::{Buffer, Completion, CompletionType, MemoryIO, OpenFlags, IO},
-        storage::database::DatabaseFile,
+        storage::{database::DatabaseFile, pager::DB_STATE_UNITIALIZED},
         types::Text,
         vdbe::Register,
-        BufferPool, Connection, StepResult, WalFileShared, WriteCompletion,
+        BufferPool, Connection, DatabaseStorage, StepResult, WalFileShared, WriteCompletion,
     };
-    use std::{cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, rc::Rc, sync::Arc};
+    use std::{
+        cell::RefCell,
+        collections::HashSet,
+        mem::transmute,
+        ops::Deref,
+        rc::Rc,
+        sync::{
+            atomic::{self, AtomicUsize},
+            Arc, Mutex,
+        },
+    };
 
     use tempfile::TempDir;
 
@@ -6771,14 +6781,32 @@ mod tests {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
-        let db_file = Arc::new(DatabaseFile::new(io_file));
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("test.db", OpenFlags::Create, true).unwrap(),
+        ));
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
 
-        let wal_shared = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
+        let shared_wal = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
 
-        let btree = BTree::open(io.clone(), Some(wal_shared), db_file.to_owned()).unwrap();
-        // FIXME: handle page cache is full
+        let wal_has_frames = unsafe { &*shared_wal.as_ref().get() }
+            .max_frame
+            .load(atomic::Ordering::SeqCst)
+            > 0;
+
+        let is_empty = if db_file.size().unwrap() == 0 && !wal_has_frames {
+            DB_STATE_UNITIALIZED
+        } else {
+            DB_STATE_INITIALIZED
+        };
+
+        let btree = BTree::open(
+            io.clone(),
+            Some(shared_wal),
+            db_file.clone(),
+            Arc::new(AtomicUsize::new(is_empty)),
+            Arc::new(Mutex::new(())),
+        )
+        .unwrap(); // FIXME: handle page cache is full
         let page2 = btree.allocate_page().unwrap();
         let page2 = Arc::new(BTreePageInner::new(page2));
         page2.init(PageType::TableLeaf, 0, 4096);
@@ -7277,9 +7305,27 @@ mod tests {
         ));
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
-        let wal_shared = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
+        let shared_wal = WalFileShared::new_shared(page_size, &io, wal_file).unwrap();
 
-        let btree = BTree::open(io.clone(), Some(wal_shared.clone()), db_file.clone()).unwrap();
+        let wal_has_frames = unsafe { &*shared_wal.as_ref().get() }
+            .max_frame
+            .load(atomic::Ordering::SeqCst)
+            > 0;
+
+        let is_empty = if db_file.size().unwrap() == 0 && !wal_has_frames {
+            DB_STATE_UNITIALIZED
+        } else {
+            DB_STATE_INITIALIZED
+        };
+
+        let btree = BTree::open(
+            io.clone(),
+            Some(shared_wal),
+            db_file.clone(),
+            Arc::new(AtomicUsize::new(is_empty)),
+            Arc::new(Mutex::new(())),
+        )
+        .unwrap();
 
         btree.pager.io.run_once().unwrap();
 

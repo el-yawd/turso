@@ -1,6 +1,9 @@
 use parking_lot::RwLock;
 
-use std::cell::OnceCell;
+use std::{
+    cell::OnceCell,
+    sync::{atomic::AtomicUsize, Mutex},
+};
 
 use crate::{
     storage::{
@@ -170,6 +173,8 @@ impl BTree {
         io: Arc<dyn IO>,
         wal: Option<Arc<UnsafeCell<WalFileShared>>>,
         db_file: Arc<dyn DatabaseStorage>,
+        is_empty: Arc<AtomicUsize>,
+        init_lock: Arc<Mutex<()>>,
     ) -> Result<Rc<Self>> {
         let buffer_pool = Rc::new(BufferPool::new(None));
 
@@ -187,6 +192,8 @@ impl BTree {
                 io.clone(),
                 Arc::new(RwLock::new(DumbLruPageCache::default())),
                 buffer_pool,
+                is_empty.clone(),
+                init_lock.clone(),
             )?);
 
             let page_size = header_accessor::get_page_size(&pager)
@@ -216,6 +223,8 @@ impl BTree {
             io.clone(),
             Arc::new(RwLock::new(DumbLruPageCache::default())),
             buffer_pool.clone(),
+            is_empty.clone(),
+            init_lock.clone(),
         )?);
 
         Ok(Rc::new(Self {
@@ -881,19 +890,17 @@ pub mod ptrmap {
 #[cfg(test)]
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap_tests {
-    use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use super::ptrmap::*;
     use super::*;
     use crate::io::{MemoryIO, OpenFlags, IO};
-    use crate::storage::buffer_pool::BufferPool;
     use crate::storage::database::{DatabaseFile, DatabaseStorage};
-    use crate::storage::page_cache::DumbLruPageCache;
-    use crate::storage::pager::Pager;
+    use crate::storage::pager::{Pager, DB_STATE_INITIALIZED, DB_STATE_UNITIALIZED};
     use crate::storage::sqlite3_ondisk::MIN_PAGE_SIZE;
-    use crate::storage::wal::{WalFile, WalFileShared};
+    use crate::storage::wal::WalFileShared;
 
     pub fn run_until_done<T>(
         mut action: impl FnMut() -> Result<CursorResult<T>>,
@@ -915,11 +922,6 @@ mod ptrmap_tests {
             io.open_file("test.db", OpenFlags::Create, true).unwrap(),
         ));
 
-        //  Construct interfaces for the pager
-        let buffer_pool = Rc::new(BufferPool::new(Some(page_size as usize)));
-        let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(
-            (initial_db_pages + 10) as usize,
-        )));
         let shared_wal = WalFileShared::new_shared(
             page_size,
             &io.clone(),
@@ -928,13 +930,25 @@ mod ptrmap_tests {
         )
         .unwrap();
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            io.clone(),
-            shared_wal.clone(),
-            buffer_pool.clone(),
-        )));
+        let wal_has_frames = unsafe { &*shared_wal.as_ref().get() }
+            .max_frame
+            .load(Ordering::SeqCst)
+            > 0;
 
-        let btree = BTree::open(io.clone(), Some(shared_wal), db_file.clone()).unwrap();
+        let is_empty = if db_file.size().unwrap() == 0 && !wal_has_frames {
+            DB_STATE_UNITIALIZED
+        } else {
+            DB_STATE_INITIALIZED
+        };
+
+        let btree = BTree::open(
+            io.clone(),
+            Some(shared_wal),
+            db_file.clone(),
+            Arc::new(AtomicUsize::new(is_empty)),
+            Arc::new(Mutex::new(())),
+        )
+        .unwrap();
         run_until_done(|| btree.pager.allocate_page1(), &btree.pager).unwrap();
         header_accessor::set_vacuum_mode_largest_root_page(&btree.pager, 1).unwrap();
 

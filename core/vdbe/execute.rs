@@ -7,7 +7,7 @@ use crate::storage::btree_cursor::{
     integrity_check, BTreeCursor, BTreeKey, IntegrityCheckError, IntegrityCheckState,
 };
 use crate::storage::database::FileMemoryStorage;
-use crate::storage::page_cache::DumbLruPageCache;
+use crate::storage::pager::{DB_STATE_INITIALIZED, DB_STATE_UNITIALIZED};
 use crate::storage::{self, header_accessor};
 use crate::translate::collate::CollationSeq;
 use crate::types::{ImmutableRecord, Text};
@@ -26,6 +26,8 @@ use crate::{
     },
     types::compare_immutable,
 };
+use std::sync::atomic::{self, AtomicUsize};
+use std::sync::Mutex;
 use std::{borrow::BorrowMut, rc::Rc, sync::Arc};
 
 use crate::{pseudo::PseudoCursor, result::LimboResult};
@@ -49,7 +51,8 @@ use crate::{
 };
 
 use crate::{
-    info, BufferPool, MvCursor, OpenFlags, Pager, RefValue, Row, StepResult, TransactionState, IO,
+    info, BufferPool, DatabaseStorage, MvCursor, OpenFlags, Pager, RefValue, Row, StepResult,
+    TransactionState, WalFileShared, IO,
 };
 
 use super::{
@@ -5215,20 +5218,41 @@ pub fn op_open_ephemeral(
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
             let conn = program.connection.clone();
-            let io = conn.btree.io.get_memory_io();
+            let io: Arc<dyn IO> = conn.btree.io.get_memory_io();
 
             let file = io.open_file("", OpenFlags::Create, true)?;
-            let db_file = Arc::new(FileMemoryStorage::new(file));
+            let db_file: Arc<dyn DatabaseStorage> = Arc::new(FileMemoryStorage::new(file));
 
-            let buffer_pool = Rc::new(BufferPool::new(None));
-            let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
+            let page_size = storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE as u32;
+            let shared_wal = WalFileShared::new_shared(
+                page_size,
+                &io.clone(),
+                io.open_file("", OpenFlags::Create, false).unwrap(),
+            )
+            .unwrap();
 
-            let btree = BTree::open(io.clone(), None, db_file.clone())?;
+            let wal_has_frames = unsafe { &*shared_wal.as_ref().get() }
+                .max_frame
+                .load(atomic::Ordering::SeqCst)
+                > 0;
 
+            let is_empty = if db_file.size().unwrap() == 0 && !wal_has_frames {
+                DB_STATE_UNITIALIZED
+            } else {
+                DB_STATE_INITIALIZED
+            };
+
+            let btree = BTree::open(
+                io.clone(),
+                Some(shared_wal),
+                db_file.clone(),
+                Arc::new(AtomicUsize::new(is_empty)),
+                Arc::new(Mutex::new(())),
+            )
+            .unwrap();
             let page_size = header_accessor::get_page_size(&btree.pager)
                 .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
                 as usize;
-            buffer_pool.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { btree };
         }

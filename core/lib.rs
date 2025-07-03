@@ -59,7 +59,8 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell, UnsafeCell},
@@ -117,6 +118,8 @@ pub struct Database {
     path: String,
     io: Arc<dyn IO>,
     maybe_shared_wal: RwLock<Option<Arc<UnsafeCell<WalFileShared>>>>,
+    is_empty: Arc<AtomicUsize>,
+    init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
 }
 
@@ -207,6 +210,8 @@ impl Database {
             db_file,
             io: io.clone(),
             open_flags: flags,
+            is_empty: Arc::new(AtomicUsize::new(is_empty)),
+            init_lock: Arc::new(Mutex::new(())),
         };
         let db = Arc::new(db);
 
@@ -233,31 +238,19 @@ impl Database {
     }
 
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        let buffer_pool = Rc::new(BufferPool::new(None));
-
+        // No pages in DB file or WAL -> empty database
+        let is_empty = self.is_empty.clone();
         // Open existing WAL file if present
         if let Some(shared_wal) = self.maybe_shared_wal.read().clone() {
-            // No pages in DB file or WAL -> empty database
-            let wal = Rc::new(RefCell::new(WalFile::new(
+            let btree = BTree::open(
                 self.io.clone(),
-                shared_wal.clone(),
-                buffer_pool.clone(),
-            )));
-            let pager = Rc::new(Pager::new(
+                Some(shared_wal),
                 self.db_file.clone(),
-                wal,
-                self.io.clone(),
-                Arc::new(RwLock::new(DumbLruPageCache::default())),
-                buffer_pool,
-            )?);
-
-            let page_size = header_accessor::get_page_size(&pager)
-                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-                as u32;
-            let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
+                is_empty,
+                self.init_lock.clone(),
+            )?;
+            let default_cache_size = header_accessor::get_default_page_cache_size(&btree.pager)
                 .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
-            pager.buffer_pool.set_page_size(page_size as usize);
-            let btree = BTree::open(self.io.clone(), Some(shared_wal), self.db_file.clone())?;
             let conn = Arc::new(Connection {
                 _db: self.clone(),
                 btree,
@@ -279,20 +272,7 @@ impl Database {
             return Ok(conn);
         };
 
-        // No existing WAL; create one.
-        // TODO: currently Pager needs to be instantiated with some implementation of trait Wal, so here's a workaround.
-        let dummy_wal = Rc::new(RefCell::new(DummyWAL {}));
-        let mut pager = Pager::new(
-            self.db_file.clone(),
-            dummy_wal,
-            self.io.clone(),
-            Arc::new(RwLock::new(DumbLruPageCache::default())),
-            buffer_pool.clone(),
-        )?;
-        let page_size = header_accessor::get_page_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;
-        let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
+        let page_size = storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE as u32;
 
         let wal_path = format!("{}-wal", self.path);
         let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
@@ -300,13 +280,16 @@ impl Database {
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
         // can open the existing WAL.
         *self.maybe_shared_wal.write() = Some(real_shared_wal.clone());
-        let wal = Rc::new(RefCell::new(WalFile::new(
+
+        let btree = BTree::open(
             self.io.clone(),
-            real_shared_wal.clone(),
-            buffer_pool,
-        )));
-        pager.set_wal(wal);
-        let btree = BTree::open(self.io.clone(), Some(real_shared_wal), self.db_file.clone())?;
+            Some(real_shared_wal),
+            self.db_file.clone(),
+            is_empty,
+            self.init_lock.clone(),
+        )?;
+        let default_cache_size = header_accessor::get_default_page_cache_size(&btree.pager)
+            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
         let conn = Arc::new(Connection {
             _db: self.clone(),
             btree,

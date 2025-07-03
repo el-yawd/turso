@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tracing::{trace, Level};
 
 pub struct PageInner {
@@ -202,7 +203,17 @@ pub struct Pager {
     checkpoint_state: RefCell<CheckpointState>,
     checkpoint_inflight: Rc<RefCell<usize>>,
     syncing: Rc<RefCell<bool>>,
-
+    /// 0 -> Database is empty,
+    /// 1 -> Database is being initialized,
+    /// 2 -> Database is initialized and ready for use.
+    pub is_empty: Arc<AtomicUsize>,
+    /// Mutex for synchronizing database initialization to prevent race conditions
+    init_lock: Arc<Mutex<()>>,
+    allocate_page1_state: RefCell<AllocatePage1State>,
+    /// Cache page_size and reserved_space at Pager init and reuse for subsequent
+    /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
+    /// to change it.
+    page_size: OnceCell<u16>,
     reserved_space: OnceCell<u8>,
 }
 
@@ -242,7 +253,14 @@ impl Pager {
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
         buffer_pool: Rc<BufferPool>,
+        is_empty: Arc<AtomicUsize>,
+        init_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
+        let allocate_page1_state = if is_empty.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
+            RefCell::new(AllocatePage1State::Start)
+        } else {
+            RefCell::new(AllocatePage1State::Done)
+        };
         Ok(Self {
             db_file,
             wal,
@@ -257,6 +275,10 @@ impl Pager {
             checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
             checkpoint_inflight: Rc::new(RefCell::new(0)),
             buffer_pool,
+            is_empty,
+            init_lock,
+            allocate_page1_state,
+            page_size: OnceCell::new(),
             reserved_space: OnceCell::new(),
         })
     }
@@ -265,9 +287,33 @@ impl Pager {
         self.wal = wal;
     }
 
+    pub fn allocating_page1(&self) -> bool {
+        matches!(
+            *self.allocate_page1_state.borrow(),
+            AllocatePage1State::Writing { .. }
+        )
+    }
+
     pub fn maybe_allocate_page1(&self) -> Result<CursorResult<()>> {
-        self.allocate_page1()?;
-        Ok(CursorResult::Ok(()))
+        if self.is_empty.load(Ordering::SeqCst) < DB_STATE_INITIALIZED {
+            if let Ok(_lock) = self.init_lock.try_lock() {
+                match (
+                    self.is_empty.load(Ordering::SeqCst),
+                    self.allocating_page1(),
+                ) {
+                    // In case of being empty or (allocating and this connection is performing allocation) then allocate the first page
+                    (0, false) | (1, true) => match self.allocate_page1()? {
+                        CursorResult::Ok(_) => Ok(CursorResult::Ok(())),
+                        CursorResult::IO => Ok(CursorResult::IO),
+                    },
+                    _ => Ok(CursorResult::IO),
+                }
+            } else {
+                Ok(CursorResult::IO)
+            }
+        } else {
+            Ok(CursorResult::Ok(()))
+        }
     }
 
     #[inline(always)]
