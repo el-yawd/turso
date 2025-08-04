@@ -27,12 +27,17 @@
       "x86_64-pc-windows-msvc",
       "universal-apple-darwin",
       "wasm32-wasip1-threads"
-    ]
+    ],
+    "wasm": {
+      "browser": {
+        "asyncInit": true,
+        "fs": false
+      }
+    }
   },
   "license": "MIT",
   "devDependencies": {
     "@napi-rs/cli": "^3.0.4",
-    "@napi-rs/wasm-runtime": "^1.0.1",
     "ava": "^6.0.1",
     "better-sqlite3": "^11.9.1"
   },
